@@ -48,7 +48,6 @@ use datafusion_expr::expr::{
 use datafusion_expr::expr_rewriter::normalize_col;
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas;
 use datafusion_expr::logical_plan::builder::project;
-use datafusion_expr::logical_plan::Join as HashJoin;
 use datafusion_expr::logical_plan::JoinConstraint as HashJoinConstraint;
 use datafusion_expr::logical_plan::{
     Analyze, CreateCatalog, CreateCatalogSchema,
@@ -56,7 +55,8 @@ use datafusion_expr::logical_plan::{
     DropTable, DropView, Explain, JoinType, LogicalPlan, LogicalPlanBuilder,
     Partitioning, PlanType, SetVariable, ToStringifiedPlan,
 };
-use datafusion_expr::logical_plan::{Filter, Prepare, Subquery};
+use datafusion_expr::logical_plan::{Filter, Subquery};
+use datafusion_expr::logical_plan::{Join as HashJoin, Prepare};
 use datafusion_expr::utils::{
     can_hash, check_all_column_from_schema, expand_qualified_wildcard, expand_wildcard,
     expr_as_column_expr, expr_to_columns, find_aggregate_exprs, find_column_exprs,
@@ -249,43 +249,43 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             } if constraints.is_empty()
                 && table_properties.is_empty()
                 && with_options.is_empty() =>
-            {
-                let plan = self.query_to_plan(*query, planner_context)?;
-                let input_schema = plan.schema();
+                {
+                    let plan = self.query_to_plan(*query, planner_context)?;
+                    let input_schema = plan.schema();
 
-                let plan = if !columns.is_empty() {
-                    let schema = self.build_schema(columns)?.to_dfschema_ref()?;
-                    if schema.fields().len() != input_schema.fields().len() {
-                        return Err(DataFusionError::Plan(format!(
-                            "Mismatch: {} columns specified, but result has {} columns",
-                            schema.fields().len(),
-                            input_schema.fields().len()
-                        )));
-                    }
-                    let input_fields = input_schema.fields();
-                    let project_exprs = schema
-                        .fields()
-                        .iter()
-                        .zip(input_fields)
-                        .map(|(field, input_field)| {
-                            cast(col(input_field.name()), field.data_type().clone())
-                                .alias(field.name())
-                        })
-                        .collect::<Vec<_>>();
-                    LogicalPlanBuilder::from(plan.clone())
-                        .project(project_exprs)?
-                        .build()?
-                } else {
-                    plan
-                };
+                    let plan = if !columns.is_empty() {
+                        let schema = self.build_schema(columns)?.to_dfschema_ref()?;
+                        if schema.fields().len() != input_schema.fields().len() {
+                            return Err(DataFusionError::Plan(format!(
+                                "Mismatch: {} columns specified, but result has {} columns",
+                                schema.fields().len(),
+                                input_schema.fields().len()
+                            )));
+                        }
+                        let input_fields = input_schema.fields();
+                        let project_exprs = schema
+                            .fields()
+                            .iter()
+                            .zip(input_fields)
+                            .map(|(field, input_field)| {
+                                cast(col(input_field.name()), field.data_type().clone())
+                                    .alias(field.name())
+                            })
+                            .collect::<Vec<_>>();
+                        LogicalPlanBuilder::from(plan.clone())
+                            .project(project_exprs)?
+                            .build()?
+                    } else {
+                        plan
+                    };
 
-                Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
-                    name: object_name_to_table_reference(name)?,
-                    input: Arc::new(plan),
-                    if_not_exists,
-                    or_replace,
-                }))
-            }
+                    Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
+                        name: object_name_to_table_reference(name)?,
+                        input: Arc::new(plan),
+                        if_not_exists,
+                        or_replace,
+                    }))
+                }
             Statement::CreateView {
                 or_replace,
                 name,
@@ -1017,11 +1017,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         let metadata = plan.schema().metadata().clone();
         if let LogicalPlan::Join(HashJoin {
-            join_constraint: HashJoinConstraint::Using,
-            ref on,
-            ref left,
-            ..
-        }) = plan
+                                     join_constraint: HashJoinConstraint::Using,
+                                     ref on,
+                                     ref left,
+                                     ..
+                                 }) = plan
         {
             // For query: select id from t1 join t2 using(id), this is legal.
             // We should dedup the fields for cols in using clause.
@@ -1061,7 +1061,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
 
         // process `from` clause
-        let plan = self.plan_from_tables(select.from, planner_context)?;
+        let plan =
+            self.plan_from_tables(select.from, planner_context)?;
+
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
         // build from schema for unqualifier column ambiguous check
         // we should get only one field for unqualifier column from schema.
@@ -1512,13 +1514,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         }
                     }
                 }
-                .map_err(|_: DataFusionError| {
-                    field_not_found(
-                        col.relation.as_ref().map(|s| s.to_owned()),
-                        col.name.as_str(),
-                        schema,
-                    )
-                }),
+                    .map_err(|_: DataFusionError| {
+                        field_not_found(
+                            col.relation.as_ref().map(|s| s.to_owned()),
+                            col.name.as_str(),
+                            schema,
+                        )
+                    }),
                 _ => Err(DataFusionError::Internal("Not a column".to_string())),
             })
     }
@@ -1772,6 +1774,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             rows,
         } = values;
 
+
         // values should not be based on any other schema
         let schema = DFSchema::empty();
         let values = rows
@@ -1845,6 +1848,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     "Invalid placeholder, not a number: {}",
                     param
                 )));
+                // )))
             }
         };
         // Check if the placeholder is in the parameter list
@@ -2259,8 +2263,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLExpr::AggregateExpressionWithFilter { expr, filter } => {
                 match self.sql_expr_to_logical_expr(*expr, schema, planner_context)? {
                     Expr::AggregateFunction(expr::AggregateFunction {
-                        fun, args, distinct, ..
-                    }) => Ok(Expr::AggregateFunction(expr::AggregateFunction::new( fun, args, distinct, Some(Box::new(self.sql_expr_to_logical_expr(*filter, schema, planner_context)?)) ))),
+                                                fun, args, distinct, ..
+                                            }) => Ok(Expr::AggregateFunction(expr::AggregateFunction::new(fun, args, distinct, Some(Box::new(self.sql_expr_to_logical_expr(*filter, schema, planner_context)?))))),
                     _ => Err(DataFusionError::Internal("AggregateExpressionWithFilter expression was not an AggregateFunction".to_string()))
                 }
             }
@@ -2333,7 +2337,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             )?;
 
                             Expr::WindowFunction(expr::WindowFunction::new(
-                                 WindowFunction::AggregateFunction(
+                                WindowFunction::AggregateFunction(
                                     aggregate_fun,
                                 ),
                                 args,
@@ -3785,8 +3789,7 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_and_where_filtering_on_aggregate_column(
-    ) {
+    fn select_aggregate_with_group_by_with_having_and_where_filtering_on_aggregate_column() {
         let sql = "SELECT first_name, MAX(age)
                    FROM person
                    WHERE id > 5 AND age > 18
@@ -3814,8 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_using_columns_with_and_without_their_aliases(
-    ) {
+    fn select_aggregate_with_group_by_with_having_using_columns_with_and_without_their_aliases() {
         let sql = "SELECT first_name AS fn, MAX(age) AS max_age
                    FROM person
                    GROUP BY first_name
@@ -3882,8 +3884,7 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_aliased_with_group_by_with_having_referencing_aggregate_by_its_alias(
-    ) {
+    fn select_aggregate_aliased_with_group_by_with_having_referencing_aggregate_by_its_alias() {
         let sql = "SELECT first_name, MAX(age) AS max_age
                    FROM person
                    GROUP BY first_name
@@ -3896,8 +3897,7 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_compound_aliased_with_group_by_with_having_referencing_compound_aggregate_by_its_alias(
-    ) {
+    fn select_aggregate_compound_aliased_with_group_by_with_having_referencing_compound_aggregate_by_its_alias() {
         let sql = "SELECT first_name, MAX(age) + 1 AS max_age_plus_one
                    FROM person
                    GROUP BY first_name
@@ -3911,8 +3911,7 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_using_derived_column_aggreagate_not_in_select(
-    ) {
+    fn select_aggregate_with_group_by_with_having_using_derived_column_aggreagate_not_in_select() {
         let sql = "SELECT first_name, MAX(age)
                    FROM person
                    GROUP BY first_name
@@ -4237,8 +4236,7 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resolvable(
-    ) {
+    fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resolvable() {
         quick_test(
             "SELECT age + 1, MIN(first_name) FROM person GROUP BY age + 1",
             "Projection: person.age + Int64(1), MIN(person.first_name)\
@@ -4265,8 +4263,7 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_not_resolvable(
-    ) {
+    fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_not_resolvable() {
         // The query should fail, because age + 9 is not in the group by.
         let sql =
             "SELECT ((age + 1) / 2) * (age + 9), MIN(first_name) FROM person GROUP BY age + 1";
@@ -4278,8 +4275,7 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_selected(
-    ) {
+    fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_selected() {
         let sql = "SELECT age, MIN(first_name) FROM person GROUP BY age + 1";
         let err = logical_plan(sql).expect_err("query should have failed");
         assert_eq!("Plan(\"Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), MIN(person.first_name)\")",
@@ -5328,7 +5324,7 @@ mod tests {
         sql: &str,
         dialect: &dyn Dialect,
     ) -> Result<LogicalPlan> {
-        let context = MockContextProvider::default();
+        let context = MockContextProvider {};
         let planner = SqlToRel::new(&context);
         let result = DFParser::parse_sql_with_dialect(sql, dialect);
         let mut ast = result?;
@@ -5340,7 +5336,7 @@ mod tests {
         dialect: &dyn Dialect,
         options: ParserOptions,
     ) -> Result<LogicalPlan> {
-        let context = MockContextProvider::default();
+        let context = MockContextProvider {};
         let planner = SqlToRel::new_with_options(&context, options);
         let result = DFParser::parse_sql_with_dialect(sql, dialect);
         let mut ast = result?;
@@ -5362,38 +5358,18 @@ mod tests {
         sql: &str,
         expected_plan: &str,
         expected_data_types: &str,
-    ) -> LogicalPlan {
+    ) {
         let plan = logical_plan(sql).unwrap();
-
-        let assert_plan = plan.clone();
         // verify plan
-        assert_eq!(format!("{:?}", assert_plan), expected_plan);
-
+        assert_eq!(format!("{:?}", plan), expected_plan);
         // verify data types
-        if let LogicalPlan::Prepare(Prepare { data_types, .. }) = assert_plan {
+        if let LogicalPlan::Prepare(Prepare { data_types, .. }) = plan {
             let dt = format!("{:?}", data_types);
             assert_eq!(dt, expected_data_types);
         }
-
-        plan
     }
 
-    fn prepare_stmt_replace_params_quick_test(
-        plan: LogicalPlan,
-        param_values: Vec<ScalarValue>,
-        expected_plan: &str,
-    ) -> LogicalPlan {
-        // replace params
-        let plan = plan.with_param_values(param_values).unwrap();
-        assert_eq!(format!("{:?}", plan), expected_plan);
-
-        plan
-    }
-
-    #[derive(Default)]
-    struct MockContextProvider {
-        udafs: HashMap<String, Arc<AggregateUDF>>,
-    }
+    struct MockContextProvider {}
 
     impl ContextProvider for MockContextProvider {
         fn get_table_provider(
@@ -5479,8 +5455,8 @@ mod tests {
             unimplemented!()
         }
 
-        fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-            self.udafs.get(name).map(Arc::clone)
+        fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
+            unimplemented!()
         }
 
         fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
@@ -6208,13 +6184,17 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "value: Internal(\"Invalid placeholder, not a number: $foo\""
+    expected = "value: Internal(\"Invalid placeholder, not a number: $foo\""
     )]
     fn test_prepare_statement_to_plan_panic_param_format() {
         // param is not number following the $ sign
         // panic due to error returned from the parser
         let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age = $foo";
-        logical_plan(sql).unwrap();
+
+        let expected_plan = "whatever";
+        let expected_dt = "whatever";
+
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
@@ -6223,35 +6203,50 @@ mod tests {
         // param is not number following the $ sign
         // panic due to error returned from the parser
         let sql = "PREPARE AS SELECT id, age  FROM person WHERE age = $foo";
-        logical_plan(sql).unwrap();
+        let expected_plan = "whatever";
+        let expected_dt = "whatever";
+
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
     #[should_panic(
-        expected = "value: SchemaError(FieldNotFound { field: Column { relation: None, name: \"id\" }, valid_fields: Some([]) })"
+    expected = "value: SchemaError(FieldNotFound { field: Column { relation: None, name: \"id\" }, valid_fields: Some([]) })"
     )]
     fn test_prepare_statement_to_plan_panic_no_relation_and_constant_param() {
         let sql = "PREPARE my_plan(INT) AS SELECT id + $1";
-        logical_plan(sql).unwrap();
+
+        let expected_plan = "whatever";
+        let expected_dt = "whatever";
+
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
     #[should_panic(
-        expected = "value: Internal(\"Placehoder $2 does not exist in the parameter list: [Int32]\")"
+    expected = "value: Internal(\"Placehoder $2 does not exist in the parameter list: [Int32]\")"
     )]
     fn test_prepare_statement_to_plan_panic_no_data_types() {
         // only provide 1 data type while using 2 params
         let sql = "PREPARE my_plan(INT) AS SELECT 1 + $1 + $2";
-        logical_plan(sql).unwrap();
+
+        let expected_plan = "whatever";
+        let expected_dt = "whatever";
+
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
     #[should_panic(
-        expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
+    expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
     )]
     fn test_prepare_statement_to_plan_panic_is_param() {
         let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age is $1";
-        logical_plan(sql).unwrap();
+
+        let expected_plan = "whatever";
+        let expected_dt = "whatever";
+
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
@@ -6266,18 +6261,9 @@ mod tests {
 
         let expected_dt = "[Int32]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
 
-        ///////////////////
-        // replace params with values
-        let param_values = vec![ScalarValue::Int32(Some(10))];
-        let expected_plan = "Projection: person.id, person.age\
-        \n  Filter: person.age = Int64(10)\
-        \n    TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-
-        //////////////////////////////////////////
+        /////////////////////////
         // no embedded parameter and no declare it
         let sql = "PREPARE my_plan AS SELECT id, age  FROM person WHERE age = 10";
 
@@ -6288,54 +6274,7 @@ mod tests {
 
         let expected_dt = "[]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![];
-        let expected_plan = "Projection: person.id, person.age\
-        \n  Filter: person.age = Int64(10)\
-        \n    TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-    }
-
-    #[test]
-    #[should_panic(expected = "value: Internal(\"Expected 1 parameters, got 0\")")]
-    fn test_prepare_statement_to_plan_one_param_no_value_panic() {
-        // no embedded parameter but still declare it
-        let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age = 10";
-        let plan = logical_plan(sql).unwrap();
-        // declare 1 param but provide 0
-        let param_values = vec![];
-        let expected_plan = "whatever";
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "value: Internal(\"Expected parameter of type Int32, got Float64 at index 0\")"
-    )]
-    fn test_prepare_statement_to_plan_one_param_one_value_different_type_panic() {
-        // no embedded parameter but still declare it
-        let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age = 10";
-        let plan = logical_plan(sql).unwrap();
-        // declare 1 param but provide 0
-        let param_values = vec![ScalarValue::Float64(Some(20.0))];
-        let expected_plan = "whatever";
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-    }
-
-    #[test]
-    #[should_panic(expected = "value: Internal(\"Expected 0 parameters, got 1\")")]
-    fn test_prepare_statement_to_plan_no_param_on_value_panic() {
-        // no embedded parameter but still declare it
-        let sql = "PREPARE my_plan AS SELECT id, age  FROM person WHERE age = 10";
-        let plan = logical_plan(sql).unwrap();
-        // declare 1 param but provide 0
-        let param_values = vec![ScalarValue::Int32(Some(10))];
-        let expected_plan = "whatever";
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
@@ -6346,50 +6285,25 @@ mod tests {
         \n  Projection: $1\n    EmptyRelation";
         let expected_dt = "[Int32]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
 
-        ///////////////////
-        // replace params with values
-        let param_values = vec![ScalarValue::Int32(Some(10))];
-        let expected_plan = "Projection: Int32(10)\n  EmptyRelation";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-
-        ///////////////////////////////////////
+        /////////////////////////
         let sql = "PREPARE my_plan(INT) AS SELECT 1 + $1";
 
         let expected_plan = "Prepare: \"my_plan\" [Int32] \
         \n  Projection: Int64(1) + $1\n    EmptyRelation";
         let expected_dt = "[Int32]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
 
-        ///////////////////
-        // replace params with values
-        let param_values = vec![ScalarValue::Int32(Some(10))];
-        let expected_plan = "Projection: Int64(1) + Int32(10)\n  EmptyRelation";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-
-        ///////////////////////////////////////
+        /////////////////////////
         let sql = "PREPARE my_plan(INT, DOUBLE) AS SELECT 1 + $1 + $2";
 
         let expected_plan = "Prepare: \"my_plan\" [Int32, Float64] \
         \n  Projection: Int64(1) + $1 + $2\n    EmptyRelation";
         let expected_dt = "[Int32, Float64]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![
-            ScalarValue::Int32(Some(10)),
-            ScalarValue::Float64(Some(10.0)),
-        ];
-        let expected_plan =
-            "Projection: Int64(1) + Int32(10) + Float64(10)\n  EmptyRelation";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
@@ -6403,48 +6317,14 @@ mod tests {
 
         let expected_dt = "[Int32]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![ScalarValue::Int32(Some(10))];
-        let expected_plan = "Projection: person.id, person.age\
-        \n  Filter: person.age = Int32(10)\
-        \n    TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
-    }
-
-    #[test]
-    fn test_prepare_statement_to_plan_data_type() {
-        let sql = "PREPARE my_plan(DOUBLE) AS SELECT id, age  FROM person WHERE age = $1";
-
-        // age is defined as Int32 but prepare statement declares it as DOUBLE/Float64
-        // Prepare statement and its logical plan should be created successfully
-        let expected_plan = "Prepare: \"my_plan\" [Float64] \
-        \n  Projection: person.id, person.age\
-        \n    Filter: person.age = $1\
-        \n      TableScan: person";
-
-        let expected_dt = "[Float64]";
-
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values still succeed and use Float64
-        let param_values = vec![ScalarValue::Float64(Some(10.0))];
-        let expected_plan = "Projection: person.id, person.age\
-        \n  Filter: person.age = Float64(10)\
-        \n    TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
     fn test_prepare_statement_to_plan_multi_params() {
         let sql = "PREPARE my_plan(INT, STRING, DOUBLE, INT, DOUBLE, STRING) AS
-        SELECT id, age, $6
-        FROM person
+        SELECT id, age, $6  
+        FROM person 
         WHERE age IN ($1, $4) AND salary > $3 and salary < $5 OR first_name < $2";
 
         let expected_plan = "Prepare: \"my_plan\" [Int32, Utf8, Float64, Int32, Float64, Utf8] \
@@ -6454,33 +6334,16 @@ mod tests {
 
         let expected_dt = "[Int32, Utf8, Float64, Int32, Float64, Utf8]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![
-            ScalarValue::Int32(Some(10)),
-            ScalarValue::Utf8(Some("abc".to_string())),
-            ScalarValue::Float64(Some(100.0)),
-            ScalarValue::Int32(Some(20)),
-            ScalarValue::Float64(Some(200.0)),
-            ScalarValue::Utf8(Some("xyz".to_string())),
-        ];
-        let expected_plan =
-            "Projection: person.id, person.age, Utf8(\"xyz\")\
-        \n  Filter: person.age IN ([Int32(10), Int32(20)]) AND person.salary > Float64(100) AND person.salary < Float64(200) OR person.first_name < Utf8(\"abc\")\
-        \n    TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
     fn test_prepare_statement_to_plan_having() {
         let sql = "PREPARE my_plan(INT, DOUBLE, DOUBLE, DOUBLE) AS
-        SELECT id, SUM(age)
+        SELECT id, SUM(age)  
         FROM person \
-        WHERE salary > $2
-        GROUP BY id
+        WHERE salary > $2 
+        GROUP BY id 
         HAVING sum(age) < $1 AND SUM(age) > 10 OR SUM(age) in ($3, $4)\
         ";
 
@@ -6493,24 +6356,7 @@ mod tests {
 
         let expected_dt = "[Int32, Float64, Float64, Float64]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![
-            ScalarValue::Int32(Some(10)),
-            ScalarValue::Float64(Some(100.0)),
-            ScalarValue::Float64(Some(200.0)),
-            ScalarValue::Float64(Some(300.0)),
-        ];
-        let expected_plan =
-            "Projection: person.id, SUM(person.age)\
-        \n  Filter: SUM(person.age) < Int32(10) AND SUM(person.age) > Int64(10) OR SUM(person.age) IN ([Float64(200), Float64(300)])\
-        \n    Aggregate: groupBy=[[person.id]], aggr=[[SUM(person.age)]]\
-        \n      Filter: person.salary > Float64(100)\
-        \n        TableScan: person";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]
@@ -6525,20 +6371,7 @@ mod tests {
 
         let expected_dt = "[Utf8, Utf8]";
 
-        let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
-
-        ///////////////////
-        // replace params with values
-        let param_values = vec![
-            ScalarValue::Utf8(Some("a".to_string())),
-            ScalarValue::Utf8(Some("b".to_string())),
-        ];
-        let expected_plan = "Projection: num, letter\
-        \n  Projection: t.column1 AS num, t.column2 AS letter\
-        \n    SubqueryAlias: t\
-        \n      Values: (Int64(1), Utf8(\"a\")), (Int64(2), Utf8(\"b\"))";
-
-        prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+        prepare_stmt_quick_test(sql, expected_plan, expected_dt);
     }
 
     #[test]

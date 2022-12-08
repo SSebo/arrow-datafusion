@@ -256,15 +256,15 @@ pub fn compare_sort_expr(
     match (sort_expr_a, sort_expr_b) {
         (
             Expr::Sort(Sort {
-                expr: expr_a,
-                asc: asc_a,
-                nulls_first: nulls_first_a,
-            }),
+                           expr: expr_a,
+                           asc: asc_a,
+                           nulls_first: nulls_first_a,
+                       }),
             Expr::Sort(Sort {
-                expr: expr_b,
-                asc: asc_b,
-                nulls_first: nulls_first_b,
-            }),
+                           expr: expr_b,
+                           asc: asc_b,
+                           nulls_first: nulls_first_b,
+                       }),
         ) => {
             let ref_indexes_a = find_column_indexes_referenced_by_expr(expr_a, schema);
             let ref_indexes_b = find_column_indexes_referenced_by_expr(expr_b, schema);
@@ -316,7 +316,7 @@ pub fn group_window_expr_by_sort_keys(
 ) -> Result<Vec<(WindowSortKey, Vec<&Expr>)>> {
     let mut result = vec![];
     window_expr.iter().try_for_each(|expr| match expr {
-        Expr::WindowFunction(WindowFunction{ partition_by, order_by, .. }) => {
+        Expr::WindowFunction(WindowFunction { partition_by, order_by, .. }) => {
             let sort_key = generate_sort_key(partition_by, order_by)?;
             if let Some((_, values)) = result.iter_mut().find(
                 |group: &&mut (WindowSortKey, Vec<&Expr>)| matches!(group, (key, _) if *key == sort_key),
@@ -367,8 +367,8 @@ pub fn find_window_exprs(exprs: &[Expr]) -> Vec<Expr> {
 /// pass the provided test. The returned `Expr`'s are deduplicated and returned
 /// in order of appearance (depth first).
 fn find_exprs_in_exprs<F>(exprs: &[Expr], test_fn: &F) -> Vec<Expr>
-where
-    F: Fn(&Expr) -> bool,
+    where
+        F: Fn(&Expr) -> bool,
 {
     exprs
         .iter()
@@ -385,8 +385,8 @@ where
 /// provided test. The returned `Expr`'s are deduplicated and returned in order
 /// of appearance (depth first).
 fn find_exprs_in_expr<F>(expr: &Expr, test_fn: &F) -> Vec<Expr>
-where
-    F: Fn(&Expr) -> bool,
+    where
+        F: Fn(&Expr) -> bool,
 {
     let Finder { exprs, .. } = expr
         .accept(Finder::new(test_fn))
@@ -397,16 +397,16 @@ where
 
 // Visitor that find expressions that match a particular predicate
 struct Finder<'a, F>
-where
-    F: Fn(&Expr) -> bool,
+    where
+        F: Fn(&Expr) -> bool,
 {
     test_fn: &'a F,
     exprs: Vec<Expr>,
 }
 
 impl<'a, F> Finder<'a, F>
-where
-    F: Fn(&Expr) -> bool,
+    where
+        F: Fn(&Expr) -> bool,
 {
     /// Create a new finder with the `test_fn`
     fn new(test_fn: &'a F) -> Self {
@@ -418,8 +418,8 @@ where
 }
 
 impl<'a, F> ExpressionVisitor for Finder<'a, F>
-where
-    F: Fn(&Expr) -> bool,
+    where
+        F: Fn(&Expr) -> bool,
 {
     fn pre_visit(mut self, expr: &Expr) -> Result<Recursion<Self>> {
         if (self.test_fn)(expr) {
@@ -519,9 +519,9 @@ pub fn from_plan(
             )?))
         }
         LogicalPlan::Repartition(Repartition {
-            partitioning_scheme,
-            ..
-        }) => match partitioning_scheme {
+                                     partitioning_scheme,
+                                     ..
+                                 }) => match partitioning_scheme {
             Partitioning::RoundRobinBatch(n) => {
                 Ok(LogicalPlan::Repartition(Repartition {
                     partitioning_scheme: Partitioning::RoundRobinBatch(*n),
@@ -538,17 +538,17 @@ pub fn from_plan(
             })),
         },
         LogicalPlan::Window(Window {
-            window_expr,
-            schema,
-            ..
-        }) => Ok(LogicalPlan::Window(Window {
+                                window_expr,
+                                schema,
+                                ..
+                            }) => Ok(LogicalPlan::Window(Window {
             input: Arc::new(inputs[0].clone()),
             window_expr: expr[0..window_expr.len()].to_vec(),
             schema: schema.clone(),
         })),
         LogicalPlan::Aggregate(Aggregate {
-            group_expr, schema, ..
-        }) => Ok(LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
+                                   group_expr, schema, ..
+                               }) => Ok(LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
             Arc::new(inputs[0].clone()),
             expr[0..group_expr.len()].to_vec(),
             expr[group_expr.len()..].to_vec(),
@@ -560,12 +560,12 @@ pub fn from_plan(
             fetch: *fetch,
         })),
         LogicalPlan::Join(Join {
-            join_type,
-            join_constraint,
-            on,
-            null_equals_null,
-            ..
-        }) => {
+                              join_type,
+                              join_constraint,
+                              on,
+                              null_equals_null,
+                              ..
+                          }) => {
             let schema =
                 build_join_schema(inputs[0].schema(), inputs[1].schema(), join_type)?;
 
@@ -574,17 +574,17 @@ pub fn from_plan(
 
             // The preceding part of expr is equi-exprs,
             // and the struct of each equi-expr is like `left-expr = right-expr`.
-            let new_on:Vec<(Expr,Expr)> = expr.iter().take(equi_expr_count).map(|equi_expr| {
-                    if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = equi_expr {
-                        assert!(op == &Operator::Eq);
-                        Ok(((**left).clone(), (**right).clone()))
-                    } else {
-                        Err(DataFusionError::Internal(format!(
-                            "The front part expressions should be an binary expression, actual:{}",
-                            equi_expr
-                        )))
-                    }
-                }).collect::<Result<Vec<(Expr, Expr)>>>()?;
+            let new_on: Vec<(Expr, Expr)> = expr.iter().take(equi_expr_count).map(|equi_expr| {
+                if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = equi_expr {
+                    assert!(op == &Operator::Eq);
+                    Ok(((**left).clone(), (**right).clone()))
+                } else {
+                    Err(DataFusionError::Internal(format!(
+                        "The front part expressions should be an binary expression, actual:{}",
+                        equi_expr
+                    )))
+                }
+            }).collect::<Result<Vec<(Expr, Expr)>>>()?;
 
             // Assume that the last expr, if any,
             // is the filter_expr (non equality predicate from ON clause)
@@ -629,22 +629,22 @@ pub fn from_plan(
             input: Arc::new(inputs[0].clone()),
         })),
         LogicalPlan::CreateMemoryTable(CreateMemoryTable {
-            name,
-            if_not_exists,
-            or_replace,
-            ..
-        }) => Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
+                                           name,
+                                           if_not_exists,
+                                           or_replace,
+                                           ..
+                                       }) => Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
             input: Arc::new(inputs[0].clone()),
             name: name.clone(),
             if_not_exists: *if_not_exists,
             or_replace: *or_replace,
         })),
         LogicalPlan::CreateView(CreateView {
-            name,
-            or_replace,
-            definition,
-            ..
-        }) => Ok(LogicalPlan::CreateView(CreateView {
+                                    name,
+                                    or_replace,
+                                    definition,
+                                    ..
+                                }) => Ok(LogicalPlan::CreateView(CreateView {
             input: Arc::new(inputs[0].clone()),
             name: name.clone(),
             or_replace: *or_replace,
@@ -688,8 +688,8 @@ pub fn from_plan(
             Ok(plan.clone())
         }
         LogicalPlan::Prepare(Prepare {
-            name, data_types, ..
-        }) => Ok(LogicalPlan::Prepare(Prepare {
+                                 name, data_types, ..
+                             }) => Ok(LogicalPlan::Prepare(Prepare {
             name: name.clone(),
             data_types: data_types.clone(),
             input: Arc::new(inputs[0].clone()),
@@ -747,7 +747,7 @@ fn exprlist_to_fields_aggregate(
 
 /// Create field meta-data from an expression, for use in a result set schema
 pub fn exprlist_to_fields<'a>(
-    expr: impl IntoIterator<Item = &'a Expr>,
+    expr: impl IntoIterator<Item=&'a Expr>,
     plan: &LogicalPlan,
 ) -> Result<Vec<DFField>> {
     let exprs: Vec<Expr> = expr.into_iter().cloned().collect();
@@ -871,8 +871,8 @@ struct ColumnIndexesCollector<'a> {
 
 impl ExpressionVisitor for ColumnIndexesCollector<'_> {
     fn pre_visit(mut self, expr: &Expr) -> Result<Recursion<Self>>
-    where
-        Self: ExpressionVisitor,
+        where
+            Self: ExpressionVisitor,
     {
         match expr {
             Expr::Column(qc) => {
@@ -933,10 +933,10 @@ pub fn can_hash(data_type: &DataType) -> bool {
         DataType::Date32 => true,
         DataType::Date64 => true,
         DataType::Dictionary(key_type, value_type)
-            if *value_type.as_ref() == DataType::Utf8 =>
-        {
-            DataType::is_dictionary_key_type(key_type)
-        }
+        if *value_type.as_ref() == DataType::Utf8 =>
+            {
+                DataType::is_dictionary_key_type(key_type)
+            }
         _ => false,
     }
 }

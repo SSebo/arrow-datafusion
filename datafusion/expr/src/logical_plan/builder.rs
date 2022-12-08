@@ -298,11 +298,11 @@ impl LogicalPlanBuilder {
     }
 
     /// Make a builder for a prepare logical plan from the builder's plan
-    pub fn prepare(self, name: String, data_types: Vec<DataType>) -> Result<Self> {
+    pub fn prepare(&self, name: String, data_types: Vec<DataType>) -> Result<Self> {
         Ok(Self::from(LogicalPlan::Prepare(Prepare {
             name,
             data_types,
-            input: Arc::new(self.plan),
+            input: Arc::new(self.plan.clone()),
         })))
     }
 
