@@ -16,7 +16,11 @@
 // under the License.
 
 use super::*;
-use datafusion::{datasource::empty::EmptyTable, from_slice::FromSlice};
+
+use datafusion::{
+    datasource::empty::EmptyTable, from_slice::FromSlice,
+    physical_plan::collect_partitioned,
+};
 use datafusion_common::ScalarValue;
 use tempfile::TempDir;
 
@@ -1183,14 +1187,33 @@ async fn test_prepare_statement() -> Result<()> {
 
     // sql to statement then to prepare logical plan with parameters
     // c1 defined as UINT32, c2 defined as UInt64 but the params are Int32 and Float64
-    let dataframe =
-        ctx.sql("PREPARE my_plan(INT, DOUBLE) AS SELECT c1, c2 FROM test WHERE c1 > $2 AND c1 < $1").await?;
+
+    let logical_plan =
+        ctx.create_logical_plan("PREPARE my_plan(INT, DOUBLE) AS SELECT c1, c2 FROM test WHERE c1 > $2 AND c1 < $1")?;
 
     // prepare logical plan to logical plan without parameters
     let param_values = vec![ScalarValue::Int32(Some(3)), ScalarValue::Float64(Some(0.0))];
-    let dataframe = dataframe.with_param_values(param_values)?;
-    let results = dataframe.collect().await?;
+    let logical_plan = logical_plan.with_param_values(param_values)?;
 
+    // logical plan to optimized logical plan
+    let logical_plan = ctx.optimize(&logical_plan)?;
+
+    // optimized logical plan to physical plan
+    let physical_plan = ctx.create_physical_plan(&logical_plan).await?;
+
+    let task_ctx = ctx.task_ctx();
+    let results = collect_partitioned(physical_plan, task_ctx).await?;
+
+    // note that the order of partitions is not deterministic
+    let mut num_rows = 0;
+    for partition in &results {
+        for batch in partition {
+            num_rows += batch.num_rows();
+        }
+    }
+    assert_eq!(20, num_rows);
+
+    let results: Vec<RecordBatch> = results.into_iter().flatten().collect();
     let expected = vec![
         "+----+----+",
         "| c1 | c2 |",
