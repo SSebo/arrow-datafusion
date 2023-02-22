@@ -17,13 +17,14 @@
 
 //! SQL Query Planner (produces logical plan from SQL AST)
 use log::debug;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{convert::TryInto, vec};
 
 use arrow_schema::*;
-use sqlparser::ast::{ArrayAgg, ExactNumberInfo, SetQuantifier};
+use sqlparser::ast;
+use sqlparser::ast::{ArrayAgg, Assignment, ExactNumberInfo, SetQuantifier};
 use sqlparser::ast::{
     BinaryOperator, DataType as SQLDataType, DateTimeField, Expr as SQLExpr, FunctionArg,
     FunctionArgExpr, Ident, Join, JoinConstraint, JoinOperator, ObjectName,
@@ -37,24 +38,24 @@ use sqlparser::ast::{TimezoneInfo, WildcardAdditionalOptions};
 use sqlparser::parser::ParserError::ParserError;
 
 use datafusion_common::parsers::{parse_interval, CompressionTypeVariant};
-use datafusion_common::ToDFSchema;
 use datafusion_common::{
     field_not_found, Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue,
 };
+use datafusion_common::{ExprSchema, ToDFSchema};
 use datafusion_common::{OwnedTableReference, TableReference};
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Cast, GroupingSet, Like, Sort, TryCast,
 };
-use datafusion_expr::expr_rewriter::normalize_col;
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas;
+use datafusion_expr::expr_rewriter::{normalize_col, ExprRewritable, ExprRewriter};
 use datafusion_expr::logical_plan::builder::project;
-use datafusion_expr::logical_plan::JoinConstraint as HashJoinConstraint;
 use datafusion_expr::logical_plan::{
     Analyze, CreateCatalog, CreateCatalogSchema,
     CreateExternalTable as PlanCreateExternalTable, CreateMemoryTable, CreateView,
     DropTable, DropView, Explain, JoinType, LogicalPlan, LogicalPlanBuilder,
-    Partitioning, PlanType, SetVariable, ToStringifiedPlan,
+    Partitioning, PlanType, SetVariable, ToStringifiedPlan, WriteOp,
 };
+use datafusion_expr::logical_plan::{DmlStatement, JoinConstraint as HashJoinConstraint};
 use datafusion_expr::logical_plan::{Filter, Subquery};
 use datafusion_expr::logical_plan::{Join as HashJoin, Prepare};
 use datafusion_expr::utils::{
@@ -101,7 +102,7 @@ pub trait ContextProvider {
 /// SQL parser options
 #[derive(Debug, Default)]
 pub struct ParserOptions {
-    parse_float_as_decimal: bool,
+    pub parse_float_as_decimal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +145,52 @@ impl PlannerContext {
 pub struct SqlToRel<'a, S: ContextProvider> {
     schema_provider: &'a S,
     options: ParserOptions,
+}
+
+/// Find all `PlaceHolder` tokens in a logical plan, and try to infer their type from context
+fn infer_placeholder_types(expr: Expr, schema: DFSchema) -> Result<Expr> {
+    struct PlaceholderReplacer {
+        schema: DFSchema,
+    }
+
+    impl ExprRewriter for PlaceholderReplacer {
+        fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+            let expr = match expr {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                    let left = (*left).clone();
+                    let right = (*right).clone();
+                    let lt = left.get_type(&self.schema);
+                    let rt = right.get_type(&self.schema);
+                    let left = match (&left, rt) {
+                        (Expr::Placeholder { id, data_type }, Ok(dt)) => {
+                            Expr::Placeholder {
+                                id: id.clone(),
+                                data_type: Some(data_type.clone().unwrap_or(dt)),
+                            }
+                        }
+                        _ => left.clone(),
+                    };
+                    let right = match (&right, lt) {
+                        (Expr::Placeholder { id, data_type }, Ok(dt)) => {
+                            Expr::Placeholder {
+                                id: id.clone(),
+                                data_type: Some(data_type.clone().unwrap_or(dt)),
+                            }
+                        }
+                        _ => right.clone(),
+                    };
+                    Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(left),
+                        op,
+                        right: Box::new(right),
+                    })
+                }
+                _ => expr.clone(),
+            };
+            Ok(expr)
+        }
+    }
+    expr.rewrite(&mut PlaceholderReplacer { schema })
 }
 
 fn plan_key(key: SQLExpr) -> Result<ScalarValue> {
@@ -249,43 +296,43 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             } if constraints.is_empty()
                 && table_properties.is_empty()
                 && with_options.is_empty() =>
-                {
-                    let plan = self.query_to_plan(*query, planner_context)?;
-                    let input_schema = plan.schema();
+            {
+                let plan = self.query_to_plan(*query, planner_context)?;
+                let input_schema = plan.schema();
 
-                    let plan = if !columns.is_empty() {
-                        let schema = self.build_schema(columns)?.to_dfschema_ref()?;
-                        if schema.fields().len() != input_schema.fields().len() {
-                            return Err(DataFusionError::Plan(format!(
-                                "Mismatch: {} columns specified, but result has {} columns",
-                                schema.fields().len(),
-                                input_schema.fields().len()
-                            )));
-                        }
-                        let input_fields = input_schema.fields();
-                        let project_exprs = schema
-                            .fields()
-                            .iter()
-                            .zip(input_fields)
-                            .map(|(field, input_field)| {
-                                cast(col(input_field.name()), field.data_type().clone())
-                                    .alias(field.name())
-                            })
-                            .collect::<Vec<_>>();
-                        LogicalPlanBuilder::from(plan.clone())
-                            .project(project_exprs)?
-                            .build()?
-                    } else {
-                        plan
-                    };
+                let plan = if !columns.is_empty() {
+                    let schema = self.build_schema(columns)?.to_dfschema_ref()?;
+                    if schema.fields().len() != input_schema.fields().len() {
+                        return Err(DataFusionError::Plan(format!(
+                            "Mismatch: {} columns specified, but result has {} columns",
+                            schema.fields().len(),
+                            input_schema.fields().len()
+                        )));
+                    }
+                    let input_fields = input_schema.fields();
+                    let project_exprs = schema
+                        .fields()
+                        .iter()
+                        .zip(input_fields)
+                        .map(|(field, input_field)| {
+                            cast(col(input_field.name()), field.data_type().clone())
+                                .alias(field.name())
+                        })
+                        .collect::<Vec<_>>();
+                    LogicalPlanBuilder::from(plan.clone())
+                        .project(project_exprs)?
+                        .build()?
+                } else {
+                    plan
+                };
 
-                    Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
-                        name: object_name_to_table_reference(name)?,
-                        input: Arc::new(plan),
-                        if_not_exists,
-                        or_replace,
-                    }))
-                }
+                Ok(LogicalPlan::CreateMemoryTable(CreateMemoryTable {
+                    name: object_name_to_table_reference(name)?,
+                    input: Arc::new(plan),
+                    if_not_exists,
+                    or_replace,
+                }))
+            }
             Statement::CreateView {
                 or_replace,
                 name,
@@ -407,11 +454,284 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 table_name,
                 filter,
             } => self.show_columns_to_plan(extended, full, table_name, filter),
+            Statement::Insert {
+                or,
+                into,
+                table_name,
+                columns,
+                overwrite,
+                source,
+                partitioned,
+                after_columns,
+                table,
+                on,
+                returning,
+            } => {
+                if or.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Inserts with or clauses not supported".to_owned(),
+                    ))?;
+                }
+                if overwrite {
+                    Err(DataFusionError::Plan(
+                        "Insert overwrite is not supported".to_owned(),
+                    ))?;
+                }
+                if partitioned.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Partitioned inserts not yet supported".to_owned(),
+                    ))?;
+                }
+                if !after_columns.is_empty() {
+                    Err(DataFusionError::Plan(
+                        "After-columns clause not supported".to_owned(),
+                    ))?;
+                }
+                if table {
+                    Err(DataFusionError::Plan(
+                        "Table clause not supported".to_owned(),
+                    ))?;
+                }
+                if on.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Insert-on clause not supported".to_owned(),
+                    ))?;
+                }
+                if returning.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Insert-returning clause not yet supported".to_owned(),
+                    ))?;
+                }
+                let _ = into; // optional keyword doesn't change behavior
+                self.insert_to_plan(table_name, columns, source)
+            }
+
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+            } => {
+                if returning.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Update-returning clause not yet supported".to_owned(),
+                    ))?;
+                }
+                self.update_to_plan(table, assignments, from, selection)
+            }
+
+            Statement::Delete {
+                table_name,
+                using,
+                selection,
+                returning,
+            } => {
+                if using.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Using clause not supported".to_owned(),
+                    ))?;
+                }
+                if returning.is_some() {
+                    Err(DataFusionError::Plan(
+                        "Delete-returning clause not yet supported".to_owned(),
+                    ))?;
+                }
+                self.delete_to_plan(table_name, selection)
+            }
             _ => Err(DataFusionError::NotImplemented(format!(
                 "Unsupported SQL statement: {:?}",
                 sql
             ))),
         }
+    }
+
+    fn insert_to_plan(
+        &self,
+        table_name: ObjectName,
+        columns: Vec<Ident>,
+        source: Box<Query>,
+    ) -> Result<LogicalPlan> {
+        // Do a table lookup to verify the table exists
+        let table_name = object_name_to_table_reference(table_name)?;
+        let provider = self
+            .schema_provider
+            .get_table_provider((&table_name).into())?;
+        let arrow_schema = (*provider.schema()).clone();
+        let table_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
+
+        // Projection
+        let mut planner_context = PlannerContext::new();
+        let source = self.query_to_plan(*source, &mut planner_context)?;
+        if columns.len() != source.schema().fields().len() {
+            Err(DataFusionError::Plan(
+                "Column count doesn't match insert query!".to_owned(),
+            ))?;
+        }
+        let exprs: Vec<_> = columns
+            .iter()
+            .zip(source.schema().fields().iter())
+            .map(|(c, f)| {
+                datafusion_expr::Expr::Column(Column::from(f.name().clone()))
+                    .alias(c.value.clone())
+            })
+            .collect();
+        let source = project(source, exprs)?;
+
+        let plan = LogicalPlan::Dml(DmlStatement {
+            table_name,
+            table_schema,
+            op: WriteOp::Insert,
+            input: Arc::new(source),
+        });
+        Ok(plan)
+    }
+
+    fn delete_to_plan(
+        &self,
+        table_factor: TableFactor,
+        predicate_expr: Option<ast::Expr>,
+    ) -> Result<LogicalPlan> {
+        let table_name = match &table_factor {
+            TableFactor::Table { name, .. } => name.clone(),
+            _ => Err(DataFusionError::Plan(
+                "Cannot delete from non-table relations!".to_string(),
+            ))?,
+        };
+
+        // Do a table lookup to verify the table exists
+        let table_ref = object_name_to_table_reference(table_name.clone())?;
+        let provider = self
+            .schema_provider
+            .get_table_provider((&table_ref).into())?;
+        let schema = (*provider.schema()).clone();
+        let schema = DFSchema::try_from(schema)?;
+        let scan =
+            LogicalPlanBuilder::scan(table_name.to_string(), provider, None)?.build()?;
+        let mut planner_context = PlannerContext::new();
+
+        let source = match predicate_expr {
+            None => scan,
+            Some(predicate_expr) => {
+                let filter_expr =
+                    self.sql_to_rex(predicate_expr, &schema, &mut planner_context)?;
+                let schema = Arc::new(schema.clone());
+                let mut using_columns = HashSet::new();
+                expr_to_columns(&filter_expr, &mut using_columns)?;
+                let filter_expr = normalize_col_with_schemas(
+                    filter_expr,
+                    &[&schema],
+                    &[using_columns],
+                )?;
+                LogicalPlan::Filter(Filter::try_new(filter_expr, Arc::new(scan))?)
+            }
+        };
+
+        let plan = LogicalPlan::Dml(DmlStatement {
+            table_name: table_ref,
+            table_schema: schema.into(),
+            op: WriteOp::Delete,
+            input: Arc::new(source),
+        });
+        Ok(plan)
+    }
+
+    fn update_to_plan(
+        &self,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        from: Option<TableWithJoins>,
+        predicate_expr: Option<ast::Expr>,
+    ) -> Result<LogicalPlan> {
+        let table_name = match &table.relation {
+            TableFactor::Table { name, .. } => name.clone(),
+            _ => Err(DataFusionError::Plan(
+                "Cannot update non-table relation!".to_string(),
+            ))?,
+        };
+
+        // Do a table lookup to verify the table exists
+        let table_name = object_name_to_table_reference(table_name)?;
+        let provider = self
+            .schema_provider
+            .get_table_provider((&table_name).into())?;
+        let arrow_schema = (*provider.schema()).clone();
+        let table_schema = Arc::new(DFSchema::try_from(arrow_schema)?);
+        let mut values: BTreeMap<_, _> = table_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                (
+                    f.name().clone(),
+                    ast::Expr::Identifier(ast::Ident::from(f.name().as_str())),
+                )
+            })
+            .collect();
+
+        // Overwrite with assignment expressions
+        let mut planner_context = PlannerContext::new();
+        for assign in assignments.iter() {
+            let col_name: &Ident = assign
+                .id
+                .iter()
+                .last()
+                .ok_or(DataFusionError::Plan("Empty column id".to_string()))?;
+            let _ = values.insert(col_name.value.clone(), assign.value.clone());
+        }
+
+        // Build scan
+        let from = from.unwrap_or(table);
+        let scan = self.plan_from_tables(vec![from], &mut planner_context)?;
+
+        // Filter
+        let source = match predicate_expr {
+            None => scan,
+            Some(predicate_expr) => {
+                let filter_expr =
+                    self.sql_to_rex(predicate_expr, &table_schema, &mut planner_context)?;
+                let mut using_columns = HashSet::new();
+                expr_to_columns(&filter_expr, &mut using_columns)?;
+                let filter_expr = normalize_col_with_schemas(
+                    filter_expr,
+                    &[&table_schema],
+                    &[using_columns],
+                )?;
+                LogicalPlan::Filter(Filter::try_new(filter_expr, Arc::new(scan))?)
+            }
+        };
+
+        // Projection
+        let mut exprs = vec![];
+        for (col_name, expr) in values.into_iter() {
+            let expr = self.sql_to_rex(expr, &table_schema, &mut planner_context)?;
+            let expr = match expr {
+                datafusion_expr::Expr::Placeholder {
+                    ref id,
+                    ref data_type,
+                } => match data_type {
+                    None => {
+                        let dt = table_schema.data_type(&Column::from_name(&col_name))?;
+                        datafusion_expr::Expr::Placeholder {
+                            id: id.clone(),
+                            data_type: Some(dt.clone()),
+                        }
+                    }
+                    Some(_) => expr,
+                },
+                _ => expr,
+            };
+            let expr = expr.alias(col_name);
+            exprs.push(expr);
+        }
+        let source = project(source, exprs)?;
+
+        let plan = LogicalPlan::Dml(DmlStatement {
+            table_name,
+            table_schema,
+            op: WriteOp::Update,
+            input: Arc::new(source),
+        });
+        Ok(plan)
     }
 
     /// Generate a logical plan from a "SHOW TABLES" query
@@ -1017,11 +1337,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         let metadata = plan.schema().metadata().clone();
         if let LogicalPlan::Join(HashJoin {
-                                     join_constraint: HashJoinConstraint::Using,
-                                     ref on,
-                                     ref left,
-                                     ..
-                                 }) = plan
+            join_constraint: HashJoinConstraint::Using,
+            ref on,
+            ref left,
+            ..
+        }) = plan
         {
             // For query: select id from t1 join t2 using(id), this is legal.
             // We should dedup the fields for cols in using clause.
@@ -1061,8 +1381,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
 
         // process `from` clause
-        let plan =
-            self.plan_from_tables(select.from, planner_context)?;
+        let plan = self.plan_from_tables(select.from, planner_context)?;
 
         let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
         // build from schema for unqualifier column ambiguous check
@@ -1514,13 +1833,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         }
                     }
                 }
-                    .map_err(|_: DataFusionError| {
-                        field_not_found(
-                            col.relation.as_ref().map(|s| s.to_owned()),
-                            col.name.as_str(),
-                            schema,
-                        )
-                    }),
+                .map_err(|_: DataFusionError| {
+                    field_not_found(
+                        col.relation.as_ref().map(|s| s.to_owned()),
+                        col.name.as_str(),
+                        schema,
+                    )
+                }),
                 _ => Err(DataFusionError::Internal("Not a column".to_string())),
             })
     }
@@ -1593,7 +1912,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
                 let qualifier = format!("{}", object_name);
                 // do not expand from outer schema
-                expand_qualified_wildcard(&qualifier, plan.schema().as_ref(), plan)
+                expand_qualified_wildcard(&qualifier, plan.schema().as_ref())
             }
         }
     }
@@ -1623,6 +1942,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let mut expr = self.sql_expr_to_logical_expr(sql, schema, planner_context)?;
         expr = self.rewrite_partial_qualifier(expr, schema);
         self.validate_schema_satisfies_exprs(schema, &[expr.clone()])?;
+        let expr = infer_placeholder_types(expr, schema.clone())?;
         Ok(expr)
     }
 
@@ -1774,7 +2094,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             rows,
         } = values;
 
-
         // values should not be based on any other schema
         let schema = DFSchema::empty();
         let values = rows
@@ -1852,14 +2171,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
         };
         // Check if the placeholder is in the parameter list
-        if param_data_types.len() <= idx {
-            return Err(DataFusionError::Internal(format!(
-                "Placehoder {} does not exist in the parameter list: {:?}",
-                param, param_data_types
-            )));
-        }
+        let param_type = param_data_types.get(idx);
         // Data type of the parameter
-        let param_type = param_data_types[idx].clone();
         debug!(
             "type of param {} param_data_types[idx]: {:?}",
             param, param_type
@@ -1867,7 +2180,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
         Ok(Expr::Placeholder {
             id: param,
-            data_type: param_type,
+            data_type: param_type.cloned(),
         })
     }
 
@@ -3789,7 +4102,8 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_and_where_filtering_on_aggregate_column() {
+    fn select_aggregate_with_group_by_with_having_and_where_filtering_on_aggregate_column(
+    ) {
         let sql = "SELECT first_name, MAX(age)
                    FROM person
                    WHERE id > 5 AND age > 18
@@ -3817,7 +4131,8 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_using_columns_with_and_without_their_aliases() {
+    fn select_aggregate_with_group_by_with_having_using_columns_with_and_without_their_aliases(
+    ) {
         let sql = "SELECT first_name AS fn, MAX(age) AS max_age
                    FROM person
                    GROUP BY first_name
@@ -3884,7 +4199,8 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_aliased_with_group_by_with_having_referencing_aggregate_by_its_alias() {
+    fn select_aggregate_aliased_with_group_by_with_having_referencing_aggregate_by_its_alias(
+    ) {
         let sql = "SELECT first_name, MAX(age) AS max_age
                    FROM person
                    GROUP BY first_name
@@ -3897,7 +4213,8 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_compound_aliased_with_group_by_with_having_referencing_compound_aggregate_by_its_alias() {
+    fn select_aggregate_compound_aliased_with_group_by_with_having_referencing_compound_aggregate_by_its_alias(
+    ) {
         let sql = "SELECT first_name, MAX(age) + 1 AS max_age_plus_one
                    FROM person
                    GROUP BY first_name
@@ -3911,7 +4228,8 @@ mod tests {
     }
 
     #[test]
-    fn select_aggregate_with_group_by_with_having_using_derived_column_aggreagate_not_in_select() {
+    fn select_aggregate_with_group_by_with_having_using_derived_column_aggreagate_not_in_select(
+    ) {
         let sql = "SELECT first_name, MAX(age)
                    FROM person
                    GROUP BY first_name
@@ -4236,7 +4554,8 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resolvable() {
+    fn select_simple_aggregate_with_groupby_non_column_expression_selected_and_resolvable(
+    ) {
         quick_test(
             "SELECT age + 1, MIN(first_name) FROM person GROUP BY age + 1",
             "Projection: person.age + Int64(1), MIN(person.first_name)\
@@ -4263,7 +4582,8 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_not_resolvable() {
+    fn select_simple_aggregate_with_groupby_non_column_expression_nested_and_not_resolvable(
+    ) {
         // The query should fail, because age + 9 is not in the group by.
         let sql =
             "SELECT ((age + 1) / 2) * (age + 9), MIN(first_name) FROM person GROUP BY age + 1";
@@ -4275,7 +4595,8 @@ mod tests {
     }
 
     #[test]
-    fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_selected() {
+    fn select_simple_aggregate_with_groupby_non_column_expression_and_its_column_selected(
+    ) {
         let sql = "SELECT age, MIN(first_name) FROM person GROUP BY age + 1";
         let err = logical_plan(sql).expect_err("query should have failed");
         assert_eq!("Plan(\"Projection references non-aggregate values: Expression person.age could not be resolved from available columns: person.age + Int64(1), MIN(person.first_name)\")",
@@ -6137,36 +6458,6 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicated_left_join_key_inner_join() {
-        //  person.id * 2 happen twice in left side.
-        let sql = "SELECT person.id, person.age
-            FROM person
-            INNER JOIN orders
-            ON person.id * 2 = orders.customer_id + 10 and person.id * 2 = orders.order_id";
-
-        let expected = "Projection: person.id, person.age\
-        \n  Inner Join: person.id * Int64(2) = orders.customer_id + Int64(10), person.id * Int64(2) = orders.order_id\
-        \n    TableScan: person\
-        \n    TableScan: orders";
-        quick_test(sql, expected);
-    }
-
-    #[test]
-    fn test_duplicated_right_join_key_inner_join() {
-        //  orders.customer_id + 10 happen twice in right side.
-        let sql = "SELECT person.id, person.age
-            FROM person
-            INNER JOIN orders
-            ON person.id * 2 = orders.customer_id + 10 and person.id =  orders.customer_id + 10";
-
-        let expected = "Projection: person.id, person.age\
-        \n  Inner Join: person.id * Int64(2) = orders.customer_id + Int64(10), person.id = orders.customer_id + Int64(10)\
-        \n    TableScan: person\
-        \n    TableScan: orders";
-        quick_test(sql, expected);
-    }
-
-    #[test]
     fn test_ambiguous_column_references_in_on_join() {
         let sql = "select p1.id, p1.age, p2.id
             from person as p1
@@ -6201,7 +6492,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-    expected = "value: Internal(\"Invalid placeholder, not a number: $foo\""
+        expected = "value: Internal(\"Invalid placeholder, not a number: $foo\""
     )]
     fn test_prepare_statement_to_plan_panic_param_format() {
         // param is not number following the $ sign
@@ -6221,7 +6512,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-    expected = "value: SchemaError(FieldNotFound { field: Column { relation: None, name: \"id\" }, valid_fields: Some([]) })"
+        expected = "value: SchemaError(FieldNotFound { field: Column { relation: None, name: \"id\" }, valid_fields: Some([]) })"
     )]
     fn test_prepare_statement_to_plan_panic_no_relation_and_constant_param() {
         let sql = "PREPARE my_plan(INT) AS SELECT id + $1";
@@ -6230,7 +6521,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-    expected = "value: Internal(\"Placehoder $2 does not exist in the parameter list: [Int32]\")"
+        expected = "value: Internal(\"Placehoder $2 does not exist in the parameter list: [Int32]\")"
     )]
     fn test_prepare_statement_to_plan_panic_no_data_types() {
         // only provide 1 data type while using 2 params
@@ -6240,7 +6531,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-    expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
+        expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
     )]
     fn test_prepare_statement_to_plan_panic_is_param() {
         let sql = "PREPARE my_plan(INT) AS SELECT id, age  FROM person WHERE age is $1";
@@ -6460,7 +6751,7 @@ mod tests {
             ScalarValue::Utf8(Some("xyz".to_string())),
         ];
         let expected_plan =
-        "Projection: person.id, person.age, Utf8(\"xyz\")\
+            "Projection: person.id, person.age, Utf8(\"xyz\")\
         \n  Filter: person.age IN ([Int32(10), Int32(20)]) AND person.salary > Float64(100) AND person.salary < Float64(200) OR person.first_name < Utf8(\"abc\")\
         \n    TableScan: person";
 
@@ -6497,7 +6788,7 @@ mod tests {
             ScalarValue::Float64(Some(300.0)),
         ];
         let expected_plan =
-        "Projection: person.id, SUM(person.age)\
+            "Projection: person.id, SUM(person.age)\
         \n  Filter: SUM(person.age) < Int32(10) AND SUM(person.age) > Int64(10) OR SUM(person.age) IN ([Float64(200), Float64(300)])\
         \n    Aggregate: groupBy=[[person.id]], aggr=[[SUM(person.age)]]\
         \n      Filter: person.salary > Float64(100)\

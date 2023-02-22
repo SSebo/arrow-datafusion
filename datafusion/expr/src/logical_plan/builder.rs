@@ -1068,17 +1068,17 @@ pub fn project(
             Expr::Wildcard => {
                 projected_expr.extend(expand_wildcard(input_schema, &plan)?)
             }
-            Expr::QualifiedWildcard { ref qualifier } => projected_expr
-                .extend(expand_qualified_wildcard(qualifier, input_schema, &plan)?),
+            Expr::QualifiedWildcard { ref qualifier } => {
+                projected_expr.extend(expand_qualified_wildcard(qualifier, input_schema)?)
+            }
             _ => projected_expr
                 .push(columnize_expr(normalize_col(e, &plan)?, input_schema)),
         }
     }
     validate_unique_names("Projections", projected_expr.iter())?;
-    let input_schema = DFSchema::new_with_metadata(
-        exprlist_to_fields(&projected_expr, &plan)?,
-        plan.schema().metadata().clone(),
-    )?;
+    let fields = exprlist_to_fields(&projected_expr, &plan);
+    let input_schema =
+        DFSchema::new_with_metadata(fields.unwrap(), plan.schema().metadata().clone())?;
 
     Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
         projected_expr,

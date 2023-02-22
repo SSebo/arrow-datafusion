@@ -17,6 +17,7 @@
 
 use crate::expr::BinaryExpr;
 use crate::expr_rewriter::{ExprRewritable, ExprRewriter};
+use crate::expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion};
 ///! Logical plan types
 use crate::logical_plan::builder::validate_unique_names;
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
@@ -24,7 +25,9 @@ use crate::logical_plan::extension::UserDefinedLogicalNode;
 use crate::utils::{
     self, exprlist_to_fields, from_plan, grouping_set_expr_count,
     grouping_set_to_exprlist,
-
+};
+use crate::{
+    build_join_schema, Expr, ExprSchemable, TableProviderFilterPushDown, TableSource,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::parsers::CompressionTypeVariant;
@@ -36,7 +39,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use crate::{build_join_schema, Expr, ExprSchemable, TableProviderFilterPushDown, TableSource};
 
 /// A LogicalPlan represents the different types of relational
 /// operators (such as Projection, Filter, etc) and can be created by
@@ -117,6 +119,8 @@ pub enum LogicalPlan {
     SetVariable(SetVariable),
     /// Prepare a statement
     Prepare(Prepare),
+    /// Insert / Update / Delete
+    Dml(DmlStatement),
 }
 
 impl LogicalPlan {
@@ -157,6 +161,7 @@ impl LogicalPlan {
             LogicalPlan::DropTable(DropTable { schema, .. }) => schema,
             LogicalPlan::DropView(DropView { schema, .. }) => schema,
             LogicalPlan::SetVariable(SetVariable { schema, .. }) => schema,
+            LogicalPlan::Dml(DmlStatement { table_schema, .. }) => table_schema,
         }
     }
 
@@ -217,6 +222,7 @@ impl LogicalPlan {
             LogicalPlan::DropTable(_)
             | LogicalPlan::DropView(_)
             | LogicalPlan::SetVariable(_) => vec![],
+            LogicalPlan::Dml(DmlStatement { table_schema, .. }) => vec![table_schema],
         }
     }
 
@@ -232,42 +238,71 @@ impl LogicalPlan {
     /// logical plan node. This does not include expressions in any
     /// children
     pub fn expressions(self: &LogicalPlan) -> Vec<Expr> {
+        let mut exprs = vec![];
+        self.inspect_expressions(|e| {
+            exprs.push(e.clone());
+            Ok(()) as Result<(), DataFusionError>
+        })
+        // closure always returns OK
+        .unwrap();
+        exprs
+    }
+
+    /// Calls `f` on all expressions (non-recursively) in the current
+    /// logical plan node. This does not include expressions in any
+    /// children.
+    pub fn inspect_expressions<F, E>(self: &LogicalPlan, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(&Expr) -> Result<(), E>,
+    {
         match self {
-            LogicalPlan::Projection(Projection { expr, .. }) => expr.clone(),
-            LogicalPlan::Values(Values { values, .. }) => {
-                values.iter().flatten().cloned().collect()
+            LogicalPlan::Projection(Projection { expr, .. }) => {
+                expr.iter().try_for_each(f)
             }
-            LogicalPlan::Filter(Filter { predicate, .. }) => vec![predicate.clone()],
+            LogicalPlan::Values(Values { values, .. }) => {
+                values.iter().flatten().try_for_each(f)
+            }
+            LogicalPlan::Filter(Filter { predicate, .. }) => f(predicate),
             LogicalPlan::Repartition(Repartition {
                 partitioning_scheme,
                 ..
             }) => match partitioning_scheme {
-                Partitioning::Hash(expr, _) => expr.clone(),
-                Partitioning::DistributeBy(expr) => expr.clone(),
-                Partitioning::RoundRobinBatch(_) => vec![],
+                Partitioning::Hash(expr, _) => expr.iter().try_for_each(f),
+                Partitioning::DistributeBy(expr) => expr.iter().try_for_each(f),
+                Partitioning::RoundRobinBatch(_) => Ok(()),
             },
-            LogicalPlan::Window(Window { window_expr, .. }) => window_expr.clone(),
+            LogicalPlan::Window(Window { window_expr, .. }) => {
+                window_expr.iter().try_for_each(f)
+            }
             LogicalPlan::Aggregate(Aggregate {
                 group_expr,
                 aggr_expr,
                 ..
-            }) => group_expr.iter().chain(aggr_expr.iter()).cloned().collect(),
+            }) => group_expr.iter().chain(aggr_expr.iter()).try_for_each(f),
             // There are two part of expression for join, equijoin(on) and non-equijoin(filter).
             // 1. the first part is `on.len()` equijoin expressions, and the struct of each expr is `left-on = right-on`.
             // 2. the second part is non-equijoin(filter).
-            LogicalPlan::Join(Join { on, filter, .. }) => on
-                .iter()
-                .map(|(l, r)| Expr::eq(l.clone(), r.clone()))
-                .chain(
-                    filter
-                        .as_ref()
-                        .map(|expr| vec![expr.clone()])
-                        .unwrap_or_default(),
-                )
-                .collect(),
-            LogicalPlan::Sort(Sort { expr, .. }) => expr.clone(),
-            LogicalPlan::Extension(extension) => extension.node.expressions(),
-            LogicalPlan::TableScan(TableScan { filters, .. }) => filters.clone(),
+            LogicalPlan::Join(Join { on, filter, .. }) => {
+                on.iter()
+                    // it not ideal to create an expr here to analyze them, but could cache it on the Join itself
+                    .map(|(l, r)| Expr::eq(l.clone(), r.clone()))
+                    .try_for_each(|e| f(&e))?;
+
+                if let Some(filter) = filter.as_ref() {
+                    f(filter)
+                } else {
+                    Ok(())
+                }
+            }
+            LogicalPlan::Sort(Sort { expr, .. }) => expr.iter().try_for_each(f),
+            LogicalPlan::Extension(extension) => {
+                // would be nice to avoid this copy -- maybe can
+                // update extension to just observer Exprs
+                extension.node.expressions().iter().try_for_each(f)
+            }
+            LogicalPlan::TableScan(TableScan { filters, .. }) => {
+                filters.iter().try_for_each(f)
+            }
             // plans without expressions
             LogicalPlan::EmptyRelation(_)
             | LogicalPlan::Subquery(_)
@@ -286,9 +321,8 @@ impl LogicalPlan {
             | LogicalPlan::Explain(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::Distinct(_)
-            | LogicalPlan::Prepare(_) => {
-                vec![]
-            }
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Prepare(_) => Ok(()),
         }
     }
 
@@ -314,6 +348,7 @@ impl LogicalPlan {
             LogicalPlan::Distinct(Distinct { input }) => vec![input],
             LogicalPlan::Explain(explain) => vec![&explain.plan],
             LogicalPlan::Analyze(analyze) => vec![&analyze.input],
+            LogicalPlan::Dml(write) => vec![&write.input],
             LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
             | LogicalPlan::CreateView(CreateView { input, .. })
             | LogicalPlan::Prepare(Prepare { input, .. }) => {
@@ -514,6 +549,7 @@ impl LogicalPlan {
             }
             LogicalPlan::Explain(explain) => explain.plan.accept(visitor)?,
             LogicalPlan::Analyze(analyze) => analyze.input.accept(visitor)?,
+            LogicalPlan::Dml(write) => write.input.accept(visitor)?,
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation(_)
@@ -602,7 +638,73 @@ impl LogicalPlan {
         Ok(new_plan)
     }
 
-    /// Return an Expr with all placeholders replaced with their corresponding values provided in the prams_values
+    /// Walk the logical plan, find any `PlaceHolder` tokens, and return a map of their IDs and DataTypes
+    pub fn get_parameter_types(
+        &self,
+    ) -> Result<HashMap<String, Option<DataType>>, DataFusionError> {
+        struct ParamTypeVisitor {
+            param_types: HashMap<String, Option<DataType>>,
+        }
+
+        struct ExprParamTypeVisitor {
+            param_types: HashMap<String, Option<DataType>>,
+        }
+
+        impl ExpressionVisitor for ExprParamTypeVisitor {
+            fn pre_visit(
+                mut self,
+                expr: &Expr,
+            ) -> datafusion_common::Result<Recursion<Self>>
+            where
+                Self: ExpressionVisitor,
+            {
+                if let Expr::Placeholder { id, data_type } = expr {
+                    let prev = self.param_types.get(id);
+                    match (prev, data_type) {
+                        (Some(Some(prev)), Some(dt)) => {
+                            if prev != dt {
+                                Err(DataFusionError::Plan(format!(
+                                    "Conflicting types for {id}"
+                                )))?;
+                            }
+                        }
+                        (_, Some(dt)) => {
+                            let _ = self.param_types.insert(id.clone(), Some(dt.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Recursion::Continue(self))
+            }
+        }
+
+        impl PlanVisitor for ParamTypeVisitor {
+            type Error = DataFusionError;
+
+            fn pre_visit(&mut self, plan: &LogicalPlan) -> Result<bool, Self::Error> {
+                let mut param_types = HashMap::new();
+                plan.inspect_expressions(|expr| {
+                    let mut visitor = ExprParamTypeVisitor {
+                        param_types: Default::default(),
+                    };
+                    visitor = expr.accept(visitor)?;
+                    param_types.extend(visitor.param_types);
+                    Ok(()) as Result<(), DataFusionError>
+                })?;
+                self.param_types.extend(param_types);
+                Ok(true)
+            }
+        }
+
+        let mut visitor = ParamTypeVisitor {
+            param_types: Default::default(),
+        };
+        self.accept(&mut visitor)?;
+        Ok(visitor.param_types)
+    }
+
+    /// Return an Expr with all placeholders replaced with their
+    /// corresponding values provided in the params_values
     fn replace_placeholders_with_values(
         expr: Expr,
         param_values: &Vec<ScalarValue>,
@@ -629,7 +731,7 @@ impl LogicalPlan {
                         ))
                     })?;
                     // check if the data type of the value matches the data type of the placeholder
-                    if value.get_datatype() != *data_type {
+                    if Some(value.get_datatype()) != *data_type {
                         return Err(DataFusionError::Internal(format!(
                             "Placeholder value type mismatch: expected {:?}, got {:?}",
                             data_type,
@@ -916,6 +1018,9 @@ impl LogicalPlan {
                             write!(f, "{:?}", expr_item)?;
                         }
                         Ok(())
+                    }
+                    LogicalPlan::Dml(DmlStatement { table_name, op, .. }) => {
+                        write!(f, "Dml: op=[{op}] table=[{table_name}]")
                     }
                     LogicalPlan::Filter(Filter {
                         predicate: ref expr,
@@ -1501,6 +1606,38 @@ pub struct CreateExternalTable {
     pub file_compression_type: CompressionTypeVariant,
     /// Table(provider) specific options
     pub options: HashMap<String, String>,
+}
+
+#[derive(Clone)]
+pub enum WriteOp {
+    Insert,
+    Delete,
+    Update,
+    Ctas,
+}
+
+impl Display for WriteOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteOp::Insert => write!(f, "Insert"),
+            WriteOp::Delete => write!(f, "Delete"),
+            WriteOp::Update => write!(f, "Update"),
+            WriteOp::Ctas => write!(f, "Ctas"),
+        }
+    }
+}
+
+/// The operator that modifies the content of a database (adapted from substrait WriteRel)
+#[derive(Clone)]
+pub struct DmlStatement {
+    /// The table name
+    pub table_name: OwnedTableReference,
+    /// The schema of the table (must align with Rel input)
+    pub table_schema: DFSchemaRef,
+    /// The type of operation to perform
+    pub op: WriteOp,
+    /// The relation that determines the tuples to add/remove/modify the schema must match with table_schema
+    pub input: Arc<LogicalPlan>,
 }
 
 /// Prepare a statement but do not execute it. Prepare statements can have 0 or more
