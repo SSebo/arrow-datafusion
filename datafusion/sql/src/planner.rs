@@ -6520,13 +6520,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "value: Internal(\"Placehoder $2 does not exist in the parameter list: [Int32]\")"
-    )]
-    fn test_prepare_statement_to_plan_panic_no_data_types() {
+    fn test_prepare_statement_to_plan_infer_types() {
         // only provide 1 data type while using 2 params
         let sql = "PREPARE my_plan(INT) AS SELECT 1 + $1 + $2";
-        logical_plan(sql).unwrap();
+        let plan = logical_plan(sql).unwrap();
+        let types = plan.get_parameter_types().unwrap();
+        assert_eq!(types.len(), 2)
     }
 
     #[test]
