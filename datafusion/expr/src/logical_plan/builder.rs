@@ -878,7 +878,7 @@ impl LogicalPlanBuilder {
 
                 if l_is_left && r_is_right {
                     Ok((normalized_left_key, normalized_right_key))
-                } else if r_is_left_and_l_is_right()?{
+                } else if r_is_left_and_l_is_right()? {
                     Ok((normalized_right_key, normalized_left_key))
                 } else {
                     Err(DataFusionError::Plan(format!(
@@ -946,14 +946,14 @@ pub(crate) fn validate_unique_names<'a>(
             None => {
                 unique_names.insert(name, (position, expr));
                 Ok(())
-            },
+            }
             Some((existing_position, existing_expr)) => {
                 Err(DataFusionError::Plan(
                     format!("{} require unique expression names \
                              but the expression \"{:?}\" at position {} and \"{:?}\" \
                              at position {} have the same name. Consider aliasing (\"AS\") one of them.",
-                             node_name, existing_expr, existing_position, expr, position,
-                            )
+                            node_name, existing_expr, existing_position, expr, position,
+                    )
                 ))
             }
         }
@@ -1002,12 +1002,12 @@ pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalP
                 comparison_coercion(left_field.data_type(), right_field.data_type())
                     .ok_or_else(|| {
                         DataFusionError::Plan(format!(
-                    "UNION Column {} (type: {}) is not compatible with column {} (type: {})",
-                    right_field.name(),
-                    right_field.data_type(),
-                    left_field.name(),
-                    left_field.data_type()
-                ))
+                            "UNION Column {} (type: {}) is not compatible with column {} (type: {})",
+                            right_field.name(),
+                            right_field.data_type(),
+                            left_field.name(),
+                            left_field.data_type()
+                        ))
                     })?;
 
             Ok(DFField::new(
@@ -1076,9 +1076,9 @@ pub fn project(
         }
     }
     validate_unique_names("Projections", projected_expr.iter())?;
-    let fields = exprlist_to_fields(&projected_expr, &plan);
+    let fields = exprlist_to_fields(&projected_expr, &plan)?;
     let input_schema =
-        DFSchema::new_with_metadata(fields.unwrap(), plan.schema().metadata().clone())?;
+        DFSchema::new_with_metadata(fields, plan.schema().metadata().clone())?;
 
     Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
         projected_expr,
